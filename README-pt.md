@@ -1,0 +1,123 @@
+# AxVM — Hypervisor Paralelo para Ivy Bridge
+
+O AxVM é um **monitor de máquinas virtuais especializado por microarquitetura**, criado para extrair o máximo desempenho de CPUs específicas em vez de tentar ser compatível com tudo.
+
+Este repositório contém o perfil **AxVM-Xv2**, otimizado especificamente para **Intel Xeon E5 v2 (Ivy Bridge-EP)**, com foco em **alto paralelismo, escalabilidade previsível e baixo overhead**.
+
+> O AxVM não virtualiza qualquer coisa.  
+> Ele domina o hardware para o qual foi projetado.
+
+---
+
+## Por que Ivy Bridge Xeon v2?
+
+O Xeon E5-2680 v2 representa uma classe de CPUs ainda muito presente em produção:
+- Muitos núcleos e threads
+- Clock base baixo
+- IPC moderado
+- Boa largura de banda de memória
+- Topologia NUMA estável
+
+Hypervisores genéricos tendem a subutilizar esse tipo de CPU por assumirem características de processadores modernos de alto clock.
+
+O AxVM-Xv2 faz o oposto: **abraça o paralelismo do Ivy Bridge**.
+---
+
+## Objetivos de Projeto
+
+- **Maximizar throughput por socket**
+- **Priorizar paralelismo em vez de latência**
+- **Reduzir VM-exits e IPIs**
+- **Escalonamento determinístico**
+- **NUMA como conceito central**
+- **Sem emulação de dispositivos legados**
+
+O objetivo é fazer um sistema com Xeon E5-2680 v2 se comportar, no conjunto, como CPUs de clock muito mais alto.
+
+---
+
+## Visão Geral da Arquitetura
+
+- Virtualização assistida por hardware (Intel VT-x + EPT)
+- Nenhuma emulação de CPU em software
+- Uma thread de host por vCPU
+- Pinagem estática de CPU
+- I/O tratado em lote
+- Apenas dispositivos VirtIO
+- Boot direto do kernel Linux (sem BIOS legado)
+
+Axion Control Plane | v AxVM-Xv2 | v /dev/kvm
+
+O AxVM é apenas o **motor de execução**.  
+Agendamento e orquestração são responsabilidade do Axion.
+
+---
+
+## Requisitos de CPU
+
+Este perfil do AxVM **se recusa a iniciar** caso o hardware não atenda aos requisitos.
+
+Requisitos mínimos:
+- CPU Intel
+- Ivy Bridge-EP (Xeon E5 v2)
+- VT-x
+- EPT (Extended Page Tables)
+- TSC invariante
+- x2APIC
+
+Recursos opcionais (usados quando disponíveis):
+- Escalonamento de TSC
+- Virtualização de APIC
+- Huge pages (1G)
+
+---
+
+## O que o AxVM-Xv2 faz diferente
+
+- Assume **baixo desempenho por núcleo**
+- Otimiza para **grande número de vCPUs**
+- Reduz overhead de troca de contexto
+- Prioriza throughput sobre latência
+- Usa estratégias agressivas de batching
+- Trata limites NUMA como restrições reais
+
+Este perfil evita propositalmente otimizações voltadas a CPUs de alto clock.
+
+---
+
+## O que NÃO é objetivo
+
+- Suporte a múltiplas gerações de CPU
+- Emulação de dispositivos legados (IDE, VGA, USB)
+- Migração ao vivo (neste perfil)
+- Fallback de emulação
+- Substituir o QEMU genericamente
+
+---
+
+## Relação com o Axion
+
+O AxVM foi projetado para ser iniciado e gerenciado exclusivamente pelo **Axion**, que:
+- Detecta o hardware do host
+- Seleciona o perfil correto do AxVM
+- Gerencia o ciclo de vida das VMs
+
+O AxVM expõe uma interface de controle estável, enquanto sua implementação interna varia por perfil.
+
+---
+
+## Status
+
+Este perfil está atualmente:
+- Em estágio inicial
+- Focado em correção e previsibilidade
+- Com otimizações de desempenho em andamento
+
+---
+
+## Filosofia
+
+> Diversidade de hardware não é um problema a ser escondido.  
+> É uma realidade a ser explorada conscientemente.
+
+O AxVM existe para fazer hardware antigo e moderno serem igualmente **respeitados**, não igualmente **genéricos**.
