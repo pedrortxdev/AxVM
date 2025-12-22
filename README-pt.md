@@ -9,6 +9,78 @@ Este repositório contém o perfil **AxVM-Xv2**, otimizado especificamente para 
 
 ---
 
+## Status Atual
+
+**✅ Hypervisor x86-64 Long Mode Funcional**
+
+```
+╔════════════════════════════════════════════════════════════════╗
+║                  AxVM Hypervisor v0.3                          ║
+║              Production-Grade KVM Virtualization               ║
+╚════════════════════════════════════════════════════════════════╝
+
+>>> [✓] Validation PASSED: RAX=0xcafebabedeadbeef
+>>> [✓] ✓ 64-bit Long Mode confirmed
+```
+
+O hypervisor atualmente:
+- Inicializa o KVM com verificação de capacidades
+- Aloca e mapeia memória guest via mmap
+- Configura page tables de 4 níveis (PML4 → PDPT → PD)
+- Configura GDT com segmentos de código/dados 64-bit
+- Inicializa x86-64 long mode (CR0, CR4, EFER)
+- Executa código guest e trata VM exits
+- Valida operações de registradores 64-bit
+
+---
+
+## Estrutura do Projeto
+
+```
+axvm_core/
+├── Cargo.toml          # Dependências Rust (kvm-ioctls, kvm-bindings, libc, ctrlc)
+└── src/
+    ├── main.rs         # Ciclo de vida da VM, tratamento de exits, loop principal
+    ├── memory.rs       # Gerenciamento de memória guest (mmap, huge pages, proteção)
+    ├── vcpu.rs         # Setup do vCPU (long mode, page tables, GDT, registradores)
+    ├── error.rs        # Tipos de erro com níveis de severidade
+    └── metrics.rs      # Coleta de métricas de desempenho
+```
+
+### Componentes Principais
+
+| Módulo | Descrição |
+|--------|-----------|
+| `VirtualMachine` | Struct principal com máquina de estados, métricas e shutdown gracioso |
+| `GuestMemory` | Wrapper seguro para mmap com bounds checking, huge pages, mlock |
+| `setup_long_mode` | Bootstrap do x86-64 long mode (CR0.PG, CR4.PAE, EFER.LME/LMA) |
+| `AxvmError` | Tipos de erro abrangentes com severidade e hints de recuperação |
+| `VmMetrics` | Contadores atômicos para runs do vCPU, IO exits, erros |
+
+---
+
+## Build e Execução
+
+```bash
+# Build
+cd axvm_core
+cargo build --release
+
+# Executar (requer acesso a /dev/kvm)
+cargo run
+
+# Executar com debug output
+AXVM_DEBUG=1 cargo run
+```
+
+### Requisitos
+
+- Linux com suporte a KVM (`/dev/kvm`)
+- Rust 1.70+ (edição 2021)
+- Intel VT-x ou AMD-V habilitado na BIOS
+
+---
+
 ## Por que Ivy Bridge Xeon v2?
 
 O Xeon E5-2680 v2 representa uma classe de CPUs ainda muito presente em produção:
@@ -21,6 +93,7 @@ O Xeon E5-2680 v2 representa uma classe de CPUs ainda muito presente em produç�
 Hypervisores genéricos tendem a subutilizar esse tipo de CPU por assumirem características de processadores modernos de alto clock.
 
 O AxVM-Xv2 faz o oposto: **abraça o paralelismo do Ivy Bridge**.
+
 ---
 
 ## Objetivos de Projeto
@@ -46,7 +119,15 @@ O objetivo é fazer um sistema com Xeon E5-2680 v2 se comportar, no conjunto, co
 - Apenas dispositivos VirtIO
 - Boot direto do kernel Linux (sem BIOS legado)
 
-Axion Control Plane | v AxVM-Xv2 | v /dev/kvm
+```
+Axion Control Plane
+        |
+        v
+    AxVM-Xv2
+        |
+        v
+    /dev/kvm
+```
 
 O AxVM é apenas o **motor de execução**.  
 Agendamento e orquestração são responsabilidade do Axion.
@@ -106,12 +187,19 @@ O AxVM expõe uma interface de controle estável, enquanto sua implementação i
 
 ---
 
-## Status
+## Roadmap
 
-Este perfil está atualmente:
-- Em estágio inicial
-- Focado em correção e previsibilidade
-- Com otimizações de desempenho em andamento
+- [x] Integração com KVM e detecção de capacidades
+- [x] Alocação de memória guest com mmap
+- [x] Bootstrap do x86-64 long mode
+- [x] Tratamento básico de VM exits (IO, HLT, Shutdown)
+- [x] Shutdown gracioso (Ctrl+C signal handling)
+- [x] Coleta de métricas de desempenho
+- [ ] Suporte a múltiplos vCPUs
+- [ ] Emulação de dispositivos VirtIO
+- [ ] Configuração de EPT
+- [ ] Alocação de memória NUMA-aware
+- [ ] Integração com control plane do Axion
 
 ---
 
@@ -121,3 +209,9 @@ Este perfil está atualmente:
 > É uma realidade a ser explorada conscientemente.
 
 O AxVM existe para fazer hardware antigo e moderno serem igualmente **respeitados**, não igualmente **genéricos**.
+
+---
+
+## Licença
+
+MIT
