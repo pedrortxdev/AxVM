@@ -3,8 +3,11 @@ mod memory;
 mod vcpu;
 mod error;
 mod metrics;
+mod serial;
+mod linux;
+mod loader;
 
-use kvm_ioctls::{Kvm, VmFd, VcpuFd, Cap}; // Adicionado Cap
+use kvm_ioctls::{Kvm, VmFd, VcpuFd, Cap};
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
@@ -13,21 +16,50 @@ use std::sync::Arc;
 use crate::memory::GuestMemory;
 use crate::error::{AxvmError, AxvmResult};
 use crate::metrics::VmMetrics;
+use crate::serial::SerialConsole;
 
 // ============================================================================
 // CONSTANTS
 // ============================================================================
 
+/// Guest payload: Prints "Hello from AxVM! The silicon obeys.\n" via serial
+///
+/// Assembly:
+///   mov dx, 0x3f8
+///   lea rsi, [rip + string]
+/// loop:
+///   lodsb
+///   test al, al
+///   jz halt
+///   out dx, al
+///   jmp loop
+/// halt:
+///   hlt
+///   jmp halt
+/// string: db "Hello from AxVM! The silicon obeys.", 0x0a, 0x00
 const GUEST_CODE: &[u8] = &[
-    0x48, 0xB8, 0xEF, 0xBE, 0xAD, 0xDE, 0xBE, 0xBA, 0xFE, 0xCA, // MOVABS RAX, 0xCAFEBABEDEADBEEF
-    0x66, 0xBA, 0xF8, 0x03,                                     // MOV DX, 0x3F8
-    0xEE,                                                       // OUT DX, AL
-    0xF4,                                                       // HLT
+    // --- Código ---
+    0x66, 0xba, 0xf8, 0x03,           // mov dx, 0x3f8
+    0x48, 0x8d, 0x35, 0x09, 0x00, 0x00, 0x00, // lea rsi, [rip+9]
+    0xac,                             // lodsb
+    0x84, 0xc0,                       // test al, al
+    0x74, 0x05,                       // jz halt
+    0xee,                             // out dx, al
+    0xeb, 0xf8,                       // jmp loop
+    0xf4,                             // hlt
+
+    // --- STRING PURA ---
+    b'H', b'e', b'l', b'l', b'o', b' ',
+    b'f', b'r', b'o', b'm', b' ',
+    b'A', b'x', b'V', b'M', b'!',
+    b' ', b'T', b'h', b'e', b' ',
+    b's', b'i', b'l', b'i', b'c', b'o', b'n', b' ',
+    b'o', b'b', b'e', b'y', b's', b'.',
+    b'\n', 0x00,
 ];
 
+
 const DEFAULT_MEM_SIZE: usize = 0x40000; // 256KB
-const SERIAL_PORT: u16 = 0x3F8;
-const EXPECTED_RAX: u64 = 0xCAFEBABEDEADBEEF;
 const MAX_ITERATIONS: u64 = 1_000_000;
 const VCPU_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -42,6 +74,10 @@ pub struct VmConfig {
     pub enable_metrics: bool,
     pub max_iterations: u64,
     pub timeout: Duration,
+    /// Path to Linux kernel bzImage (None = use embedded payload)
+    pub kernel_path: Option<String>,
+    /// Kernel command line
+    pub kernel_cmdline: String,
 }
 
 impl Default for VmConfig {
@@ -52,6 +88,8 @@ impl Default for VmConfig {
             enable_metrics: true,
             max_iterations: MAX_ITERATIONS,
             timeout: VCPU_TIMEOUT,
+            kernel_path: None,
+            kernel_cmdline: String::from("console=ttyS0 reboot=k panic=1"),
         }
     }
 }
@@ -96,18 +134,19 @@ pub enum OwnedVmExit {
 // ============================================================================
 
 pub struct VirtualMachine {
-    #[allow(dead_code)] // Retained for VM lifecycle management
+    #[allow(dead_code)]
     kvm: Kvm,
-    #[allow(dead_code)] // Retained for VM-level ioctls
+    #[allow(dead_code)]
     vm: VmFd,
     vcpu: VcpuFd,
-    #[allow(dead_code)] // Retained for memory access operations
+    #[allow(dead_code)]
     guest_mem: GuestMemory,
     config: VmConfig,
     state: VmState,
     metrics: Arc<VmMetrics>,
     should_stop: Arc<AtomicBool>,
     iteration_count: AtomicU64,
+    serial: Arc<SerialConsole>,
 }
 
 impl VirtualMachine {
@@ -170,6 +209,8 @@ impl VirtualMachine {
             Arc::new(VmMetrics::disabled())
         };
 
+        let serial = Arc::new(SerialConsole::new());
+
         Ok(Self {
             kvm,
             vm,
@@ -180,6 +221,7 @@ impl VirtualMachine {
             metrics,
             should_stop: Arc::new(AtomicBool::new(false)),
             iteration_count: AtomicU64::new(0),
+            serial,
         })
     }
 
@@ -361,23 +403,10 @@ impl VirtualMachine {
 
     /// Handles IO OUT operations
     fn handle_io_out(&mut self, port: u16, data: &[u8]) -> AxvmResult<ExitAction> {
-        if port == SERIAL_PORT {
-            let regs = self.vcpu.get_regs()
-                .map_err(|e| AxvmError::RegisterAccess(
-                    format!("Failed to read registers: {}", e)
-                ))?;
-
-            log_info(&format!("Serial output: port={:#x}, RAX={:#x}", port, regs.rax));
-
-            if regs.rax == EXPECTED_RAX {
-                log_success(&format!("✓ Validation PASSED: RAX={:#x}", regs.rax));
-                log_success("✓ 64-bit Long Mode confirmed");
-                return Ok(ExitAction::Stop(VmExitReason::Success));
-            } else {
-                log_error(&format!("✗ Validation FAILED: RAX={:#x} (expected {:#x})",
-                    regs.rax, EXPECTED_RAX));
-                return Ok(ExitAction::Stop(VmExitReason::ValidationFailed));
-            }
+        // Serial port range: 0x3F8 - 0x3FF (COM1)
+        if port >= serial::COM1_BASE && port < serial::COM1_BASE + 8 {
+            self.serial.write(port, data);
+            return Ok(ExitAction::Continue);
         }
 
         log_debug(&format!("IO OUT: port={:#x}, data={:?}", port, data));
