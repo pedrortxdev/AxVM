@@ -59,9 +59,9 @@ const GUEST_CODE: &[u8] = &[
 ];
 
 
-const DEFAULT_MEM_SIZE: usize = 0x40000; // 256KB
-const MAX_ITERATIONS: u64 = 1_000_000;
-const VCPU_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_MEM_SIZE: usize = 1024 * 1024 * 1024; // 1GB
+const MAX_ITERATIONS: u64 = 1_000_000_000;   // 1 billion iterations for kernel boot
+const VCPU_TIMEOUT: Duration = Duration::from_secs(120); // 2 minutes for nested virt
 
 // ============================================================================
 // CONFIGURATION
@@ -88,8 +88,9 @@ impl Default for VmConfig {
             enable_metrics: true,
             max_iterations: MAX_ITERATIONS,
             timeout: VCPU_TIMEOUT,
-            kernel_path: None,
-            kernel_cmdline: String::from("console=ttyS0 reboot=k panic=1"),
+            // Load Linux kernel by default
+            kernel_path: Some("bzImage".to_string()),
+            kernel_cmdline: String::from("console=ttyS0 earlyprintk=serial reboot=k panic=1"),
         }
     }
 }
@@ -197,11 +198,49 @@ impl VirtualMachine {
         // Setup CPUID (CRITICAL for 64-bit support)
         Self::setup_cpuid(&kvm, &mut vcpu)?;
 
-        // Bootstrap long mode
-        vcpu::setup_long_mode(&mut vcpu, &mut guest_mem)
-            .map_err(|e| AxvmError::LongModeSetup(format!("Failed to setup long mode: {}", e)))?;
+        // Load guest code - either embedded payload or Linux kernel
+        let entry_point = if let Some(ref kernel_path) = config.kernel_path {
+            // Load Linux kernel - returns the 32-bit entry point
+            loader::load_linux(
+                &mut guest_mem,
+                kernel_path,
+                config.mem_size,
+                &config.kernel_cmdline,
+            ).map_err(|e| AxvmError::MemoryWrite(format!("Kernel load failed: {}", e)))?
+        } else {
+            // Load embedded payload
+            guest_mem.write_slice(0x0, GUEST_CODE)
+                .map_err(|e| AxvmError::MemoryWrite(format!("Failed to write guest code: {}", e)))?;
+            0x0
+        };
 
-        log_success("Long mode initialized");
+        // Setup CPU mode based on boot type
+        if config.kernel_path.is_some() {
+            // Linux bzImage: 32-bit protected mode (kernel decompressor expects this)
+            vcpu::setup_protected_mode_32bit(
+                &mut vcpu,
+                &mut guest_mem,
+                entry_point,
+                linux::ZERO_PAGE_START as u64,
+            ).map_err(|e| AxvmError::LongModeSetup(format!("Failed to setup 32-bit mode: {}", e)))?;
+
+            // Debug: verify initial state
+            if let Ok(regs) = vcpu.get_regs() {
+                log_info(&format!("Initial: RIP={:#x}, RSP={:#x}, RSI={:#x}", 
+                    regs.rip, regs.rsp, regs.rsi));
+            }
+            if let Ok(sregs) = vcpu.get_sregs() {
+                log_info(&format!("Initial: CR0={:#x}, CR3={:#x}, CR4={:#x}, EFER={:#x}",
+                    sregs.cr0, sregs.cr3, sregs.cr4, sregs.efer));
+            }
+
+            log_success("32-bit protected mode initialized (Linux boot)");
+        } else {
+            // Embedded payload: 64-bit long mode
+            vcpu::setup_long_mode_with_entry(&mut vcpu, &mut guest_mem, entry_point)
+                .map_err(|e| AxvmError::LongModeSetup(format!("Failed to setup long mode: {}", e)))?;
+            log_success("64-bit long mode initialized");
+        }
 
         let metrics = if config.enable_metrics {
             Arc::new(VmMetrics::new())
@@ -312,7 +351,16 @@ impl VirtualMachine {
             let exit_reason = match self.vcpu.run() {
                 Ok(exit) => {
                     match exit {
-                        kvm_ioctls::VcpuExit::IoIn(port, data) => OwnedVmExit::IoIn(port, data.to_vec()),
+                        kvm_ioctls::VcpuExit::IoIn(port, data) => {
+                            // Handle IO reads inline to write response
+                            if port >= serial::COM1_BASE && port < serial::COM1_BASE + 8 {
+                                let value = self.serial.read(port);
+                                if !data.is_empty() {
+                                    data[0] = value;
+                                }
+                            }
+                            OwnedVmExit::IoIn(port, data.to_vec())
+                        },
                         kvm_ioctls::VcpuExit::IoOut(port, data) => OwnedVmExit::IoOut(port, data.to_vec()),
                         kvm_ioctls::VcpuExit::Hlt => OwnedVmExit::Hlt,
                         kvm_ioctls::VcpuExit::Shutdown => OwnedVmExit::Shutdown,
@@ -352,7 +400,20 @@ impl VirtualMachine {
 
             OwnedVmExit::IoIn(port, data) => {
                 self.metrics.record_io_exit();
-                log_debug(&format!("IO IN: port={:#x}, size={}", port, data.len()));
+                
+                // Handle serial port reads
+                if port >= serial::COM1_BASE && port < serial::COM1_BASE + 8 {
+                    let value = self.serial.read(port);
+                    // Write response back to vCPU
+                    // The data slice contains the buffer where we write the response
+                    if !data.is_empty() {
+                        // We need to write to vCPU's data buffer via MMIO
+                        // For IO_IN, we write the response to guest via vcpu
+                        // Actually, KVM expects us to NOT modify data here directly
+                        // Instead, we set it via the vcpu set_data method or similar
+                        // For now, the kernel will continue if we just return
+                    }
+                }
                 Ok(ExitAction::Continue)
             }
 
@@ -362,7 +423,18 @@ impl VirtualMachine {
             }
 
             OwnedVmExit::Shutdown => {
-                log_info("Guest initiated shutdown");
+                // Debug: dump registers to see where kernel crashed
+                if let Ok(regs) = self.vcpu.get_regs() {
+                    log_info(&format!("Shutdown at RIP={:#x}, RSP={:#x}, RSI={:#x}", 
+                        regs.rip, regs.rsp, regs.rsi));
+                    log_info(&format!("RAX={:#x}, RBX={:#x}, RCX={:#x}, RDX={:#x}",
+                        regs.rax, regs.rbx, regs.rcx, regs.rdx));
+                }
+                if let Ok(sregs) = self.vcpu.get_sregs() {
+                    log_info(&format!("CR0={:#x}, CR3={:#x}, CR4={:#x}, EFER={:#x}",
+                        sregs.cr0, sregs.cr3, sregs.cr4, sregs.efer));
+                }
+                log_info("Guest initiated shutdown (Triple Fault)");
                 Ok(ExitAction::Stop(VmExitReason::Shutdown))
             }
 
@@ -492,13 +564,33 @@ fn main() -> AxvmResult<()> {
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!();
 
-    let config = VmConfig::default();
+    // Check for kernel path argument (overrides default if provided)
+    let args: Vec<String> = std::env::args().collect();
+    
+    let config = if let Some(kernel_arg) = args.get(1) {
+        VmConfig {
+            kernel_path: Some(kernel_arg.clone()),
+            timeout: Duration::from_secs(30),
+            ..Default::default()
+        }
+    } else {
+        VmConfig {
+            timeout: Duration::from_secs(30),
+            ..Default::default()
+        }
+    };
     
     println!("Configuration:");
-    println!("  Memory Size:     {} bytes ({} KB)", config.mem_size, config.mem_size / 1024);
+    println!("  Memory Size:     {} bytes ({} MB)", config.mem_size, config.mem_size / (1024 * 1024));
     println!("  vCPU Count:      {}", config.vcpu_count);
     println!("  Max Iterations:  {}", config.max_iterations);
     println!("  Timeout:         {:?}", config.timeout);
+    if let Some(ref path) = config.kernel_path {
+        println!("  Kernel:          {}", path);
+        println!("  Cmdline:         {}", config.kernel_cmdline);
+    } else {
+        println!("  Mode:            Embedded payload");
+    }
     println!();
 
     let start_time = Instant::now();

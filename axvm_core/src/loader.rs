@@ -67,15 +67,14 @@ macro_rules! write_packed {
 /// * `cmdline` - Kernel command line string
 ///
 /// # Returns
-/// * `Ok(())` on success
+/// * `Ok(entry_point)` - The 32-bit entry point address (code32_start)
 /// * `Err(String)` with error description on failure
-#[allow(dead_code)]
 pub fn load_linux(
     guest_mem: &mut GuestMemory,
     kernel_path: &str,
     mem_size: usize,
     cmdline: &str,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let mut file = File::open(kernel_path)
         .map_err(|e| format!("Failed to open kernel file '{}': {}", kernel_path, e))?;
 
@@ -206,7 +205,22 @@ pub fn load_linux(
 
     log_loader(&format!("Zero Page written at {:#x}", ZERO_PAGE_START));
 
-    Ok(())
+    // Get the actual 32-bit entry point from the kernel header
+    let code32_start = read_packed!(boot_params.hdr, code32_start);
+    let entry_point = if code32_start != 0 {
+        code32_start as u64
+    } else {
+        KERNEL_START as u64
+    };
+
+    log_loader(&format!("Entry point (code32_start): {:#x}", entry_point));
+
+    // Debug: Verify first bytes of kernel in RAM
+    let first_bytes = guest_mem.read_slice(KERNEL_START, 16)
+        .map_err(|e| format!("Debug read failed: {}", e))?;
+    log_loader(&format!("Kernel first 16 bytes at {:#x}: {:02x?}", KERNEL_START, first_bytes));
+
+    Ok(entry_point)
 }
 
 // ============================================================================
