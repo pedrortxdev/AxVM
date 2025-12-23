@@ -1,20 +1,20 @@
-// src/acpi.rs
-//!
-//! ACPI Table Generator for SMP Support
-//! Generates RSDP, RSDT, and MADT tables to tell Linux about multiple CPUs
-//!
+
+
+
+
+
 
 use std::mem;
 use std::slice;
 use crate::memory::GuestMemory;
 
-// Place tables in BIOS ROM area (0xE0000-0xFFFFF) where Linux scans for RSDP
+
 pub const RSDP_START: usize = 0xE0000;
 
 #[repr(C, packed)]
 #[derive(Default, Clone, Copy)]
 struct Rsdp {
-    signature: [u8; 8],   // "RSD PTR "
+    signature: [u8; 8],   
     checksum: u8,
     oem_id: [u8; 6],
     revision: u8,
@@ -61,12 +61,12 @@ fn calculate_checksum(data: &[u8]) -> u8 {
     0u8.wrapping_sub(data.iter().fold(0u8, |acc, &x| acc.wrapping_add(x)))
 }
 
-/// Setup ACPI tables for SMP support
+
 pub fn setup_acpi(mem: &mut GuestMemory, vcpu_count: u8) -> Result<(), String> {
     let rsdt_addr = RSDP_START + mem::size_of::<Rsdp>();
     let madt_addr = rsdt_addr + mem::size_of::<SdtHeader>() + 4;
 
-    // 1. Build MADT (CPU List)
+    
     let madt_len = mem::size_of::<Madt>() + (mem::size_of::<MadtLocalApic>() * vcpu_count as usize);
     let mut madt_data = vec![0u8; madt_len];
 
@@ -78,25 +78,25 @@ pub fn setup_acpi(mem: &mut GuestMemory, vcpu_count: u8) -> Result<(), String> {
         madt.header.oem_id = *b"AXVM  ";
         madt.header.oem_table_id = *b"AXVMCPU ";
         madt.header.oem_revision = 1;
-        madt.header.creator_id = 0x4D5641; // "AVM"
+        madt.header.creator_id = 0x4D5641; 
         madt.header.creator_revision = 1;
         madt.local_apic_addr = 0xFEE00000;
-        madt.flags = 1; // PCAT_COMPAT
+        madt.flags = 1; 
 
         let entries_ptr = madt_data.as_mut_ptr().add(mem::size_of::<Madt>());
         for i in 0..vcpu_count {
             let entry = &mut *(entries_ptr.add(i as usize * mem::size_of::<MadtLocalApic>()) as *mut MadtLocalApic);
-            entry.type_ = 0; // Local APIC
+            entry.type_ = 0; 
             entry.length = 8;
             entry.acpi_processor_id = i;
             entry.apic_id = i;
-            entry.flags = 1; // Enabled
+            entry.flags = 1; 
         }
         madt.header.checksum = calculate_checksum(&madt_data);
     }
     mem.write_slice(madt_addr, &madt_data)?;
 
-    // 2. Build RSDT (Points to MADT)
+    
     let rsdt_len = mem::size_of::<SdtHeader>() + 4;
     let mut rsdt_data = vec![0u8; rsdt_len];
     unsafe {
@@ -116,7 +116,7 @@ pub fn setup_acpi(mem: &mut GuestMemory, vcpu_count: u8) -> Result<(), String> {
     }
     mem.write_slice(rsdt_addr, &rsdt_data)?;
 
-    // 3. Build RSDP (Root Pointer)
+    
     let mut rsdp = Rsdp::default();
     rsdp.signature = *b"RSD PTR ";
     rsdp.rsdt_addr = rsdt_addr as u32;
@@ -129,11 +129,11 @@ pub fn setup_acpi(mem: &mut GuestMemory, vcpu_count: u8) -> Result<(), String> {
             &rsdp as *const _ as *const u8,
             mem::size_of::<Rsdp>()
         );
-        // Calculate checksum for first 20 bytes only (ACPI 1.0 RSDP)
+        
         let checksum = calculate_checksum(&rsdp_slice[..20]);
         
         let mut rsdp_vec = rsdp_slice.to_vec();
-        rsdp_vec[8] = checksum; // checksum field offset
+        rsdp_vec[8] = checksum; 
         
         mem.write_slice(RSDP_START, &rsdp_vec)?;
     }

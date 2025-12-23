@@ -1,7 +1,7 @@
-// src/serial.rs
-//!
-//! UART 8250 Serial Console Emulator for Linux Kernel Boot
-//!
+
+
+
+
 
 use std::io::{self, Write};
 
@@ -24,7 +24,7 @@ impl SerialConsole {
                 let stdout = io::stdout();
                 let mut handle = stdout.lock();
                 
-                // Convert LF to CRLF for proper terminal display
+                
                 if byte == b'\n' {
                     let _ = handle.write_all(b"\r\n");
                 } else {
@@ -38,8 +38,8 @@ impl SerialConsole {
     pub fn read(&self, port: u16) -> u8 {
         let offset = port - COM1_BASE;
         match offset {
-            // Transmitter Holding Register Empty (bit 5) + Transmitter Empty (bit 6)
-            // This tells Linux the UART is ready to accept data immediately
+            
+            
             LINE_STATUS_REGISTER => 0x20 | 0x40,
             _ => 0,
         }

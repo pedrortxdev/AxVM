@@ -11,8 +11,30 @@ bzImage
 vmlinux
 initrd*
 disk.img
+qcow2
 
 # IDEs
 .vscode/
 .idea/
 *.swp
+linux-6.1.112.tar.xz
+./linux-6.1.112
+./bzImage-microvm
+./bzImage
+./cloud-hypervisor
+.vscode/
+.idea/
+*.swp
+linux-6.1.112.tar.xz*
+./linux-6.1.112*
+*bzImage-microvm*
+*bzImage*
+*cloud-hypervisor*
+.vscode/
+.idea/
+*.swp
+*linux-6.1.112.tar.xz
+*linux-6.1.112
+*bzImage-microvm
+*bzImage
+*cloud-hypervisor

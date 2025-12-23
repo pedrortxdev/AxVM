@@ -1,8 +1,8 @@
-// src/linux.rs
-//!
-//! Linux Boot Protocol Definitions.
-//! Fixed Alignment for v0.4
-//!
+
+
+
+
+
 
 pub const ZERO_PAGE_START: usize = 0x7000;
 pub const CMDLINE_START: usize = 0x20000;
@@ -63,40 +63,40 @@ pub struct E820Entry {
 
 #[repr(C, packed)]
 pub struct BootParams {
-    // 0x000 - 0x1E8: Padding inicial (Screen Info, etc - Ignoramos por enquanto)
+    
     pub _pad1: [u8; 0x1e8], 
     
-    // 0x1E8: E820 Entries Count
+    
     pub e820_entries: u8,
     
-    // 0x1E9: Eddbuf entries/ptr
+    
     pub eddbuf_entries: u8,
     pub eddbuf_ptr: u8,
     
-    // 0x1EB: Padding de alinhamento
+    
     pub _pad2: u8,
     
-    // 0x1EC: Max PFN
+    
     pub max_pfn: u32,
     
-    // 0x1F0: Padding para chegar em 0x1F1
+    
     pub _pad3: u8,
     
-    // 0x1F1: SETUP HEADER (O Santo Graal)
-    pub hdr: SetupHeader, // Tamanho aprox 0x7B
     
-    // Padding dinâmico entre o fim do Header e o começo do E820 Table (0x2D0)
-    // 0x2D0 - 0x1F1 - sizeof(SetupHeader)
-    // Para simplificar e evitar erros de math, usamos um buffer gigante "safe"
-    // e usamos unsafe pointer arithmetic se precisasse, mas aqui vamos confiar no packed.
-    // SetupHeader tem 123 bytes na nossa definição acima?
-    // Vamos usar um padding seguro.
+    pub hdr: SetupHeader, 
+    
+    
+    
+    
+    
+    
+    
     pub _pad4: [u8; 0x2d0 - 0x1f1 - std::mem::size_of::<SetupHeader>()],
     
-    // 0x2D0: E820 Table
+    
     pub e820_table: [E820Entry; 128],
     
-    // Resto da página (até 4096)
+    
     pub _pad5: [u8; 4096 - 0x2d0 - (128 * 20)],
 }
 

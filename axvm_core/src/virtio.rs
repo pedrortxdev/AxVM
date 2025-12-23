@@ -1,8 +1,8 @@
-// src/virtio.rs
-//!
-//! VirtIO-MMIO Block Device Driver (Data Plane)
-//! Handles Virtqueues, Descriptors, and Disk I/O.
-//!
+
+
+
+
+
 
 #![allow(dead_code)]
 
@@ -11,7 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
 use crate::memory::GuestMemory;
 
-// Register Offsets
+
 pub const VIRTIO_MMIO_MAGIC_VALUE: u64 = 0x000;
 pub const VIRTIO_MMIO_VERSION: u64 = 0x004;
 pub const VIRTIO_MMIO_DEVICE_ID: u64 = 0x008;
@@ -36,32 +36,32 @@ pub const VIRTIO_MMIO_QUEUE_USED_LOW: u64 = 0x0a0;
 pub const VIRTIO_MMIO_QUEUE_USED_HIGH: u64 = 0x0a4;
 pub const VIRTIO_MMIO_CONFIG: u64 = 0x100;
 
-// Constants
+
 const MAGIC_VALUE: u32 = 0x74726976;
 const VERSION: u32 = 2;
 const DEVICE_ID_BLOCK: u32 = 2;
 const VENDOR_ID: u32 = 0x554d4551;
 
-// Features
+
 const VIRTIO_BLK_F_SIZE_MAX: u64 = 1 << 1;
 const VIRTIO_BLK_F_SEG_MAX: u64 = 1 << 2;
 const VIRTIO_BLK_F_GEOMETRY: u64 = 1 << 4;
 const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
-// Disk Config
-const DISK_SIZE_SECTORS: u64 = 204800; // 100MB / 512
+
+const DISK_SIZE_SECTORS: u64 = 204800; 
 const SECTOR_SIZE: u32 = 512;
 
-// Request Types
-const VIRTIO_BLK_T_IN: u32 = 0;  // Read
-const VIRTIO_BLK_T_OUT: u32 = 1; // Write
 
-// Status
+const VIRTIO_BLK_T_IN: u32 = 0;  
+const VIRTIO_BLK_T_OUT: u32 = 1; 
+
+
 const VIRTIO_BLK_S_OK: u8 = 0;
 const VIRTIO_BLK_S_IOERR: u8 = 1;
 
-// Descriptor Flags
+
 const VRING_DESC_F_NEXT: u16 = 1;
 const VRING_DESC_F_WRITE: u16 = 2;
 
@@ -80,22 +80,39 @@ pub struct VirtioBlock {
     
     last_avail_idx: Mutex<u16>,
     disk: Mutex<Option<File>>,
+    disk_size: u64,  // Size in bytes
 }
 
 impl VirtioBlock {
-    pub fn new() -> Self {
-        println!(">>> [VirtIO] Initializing block device...");
+    pub fn new(disk_path: Option<&str>) -> Self {
+        tracing::info!("Initializing VirtIO block device");
         
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("disk.img")
-            .ok();
+        let (file, disk_size) = disk_path.map_or((None, 0), |path| {
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+            {
+                Ok(f) => {
+                    let size = f.metadata()
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    
+                    println!(">>> [VirtIO] Disk opened: {} ({} MB)", path, size / 1024 / 1024);
+                    tracing::info!(path = path, size_mb = size / 1024 / 1024, "Disk image opened");
+                    (Some(f), size)
+                },
+                Err(e) => {
+                    println!(">>> [VirtIO] Warning: {} not found - {}", path, e);
+                    tracing::warn!(path = path, error = %e, "Disk image not found");
+                    (None, 0)
+                }
+            }
+        });
         
-        if file.is_some() {
-            println!(">>> [VirtIO] disk.img opened successfully");
-        } else {
-            println!(">>> [VirtIO] Warning: disk.img not found - disk will be empty");
+        if disk_path.is_none() {
+            println!(">>> [VirtIO] No disk image specified");
+            tracing::info!("No disk image specified");
         }
 
         Self {
@@ -111,10 +128,11 @@ impl VirtioBlock {
             queue_used: Mutex::new(0),
             last_avail_idx: Mutex::new(0),
             disk: Mutex::new(file),
+            disk_size,
         }
     }
 
-    /// Handle MMIO read
+    
     pub fn read(&self, offset: u64, data: &mut [u8]) {
         let val: u32 = match offset {
             VIRTIO_MMIO_MAGIC_VALUE => MAGIC_VALUE,
@@ -134,8 +152,16 @@ impl VirtioBlock {
             VIRTIO_MMIO_QUEUE_READY => *self.queue_ready.lock().unwrap(),
             VIRTIO_MMIO_INTERRUPT_STATUS => *self.interrupt_status.lock().unwrap(),
             VIRTIO_MMIO_STATUS => *self.status.lock().unwrap(),
-            VIRTIO_MMIO_CONFIG => (DISK_SIZE_SECTORS & 0xFFFFFFFF) as u32,
-            0x104 => (DISK_SIZE_SECTORS >> 32) as u32,
+            VIRTIO_MMIO_CONFIG => {
+                // Capacity in 512-byte sectors (low 32 bits)
+                let sectors = self.disk_size / 512;
+                (sectors & 0xFFFFFFFF) as u32
+            },
+            0x104 => {
+                // Capacity in 512-byte sectors (high 32 bits)
+                let sectors = self.disk_size / 512;
+                (sectors >> 32) as u32
+            },
             0x114 => SECTOR_SIZE,
             _ => 0,
         };
@@ -145,9 +171,9 @@ impl VirtioBlock {
         data[..len].copy_from_slice(&bytes[..len]);
     }
 
-    /// Handle MMIO write - returns true if IRQ needed
-    pub fn write(&self, offset: u64, data: &[u8], mem: &mut GuestMemory) -> bool {
-        if data.len() < 4 { return false; }
+    
+    pub fn write(&self, offset: u64, data: &[u8], mem: &mut GuestMemory) -> Result<bool, String> {
+        if data.len() < 4 { return Ok(false); }
         let val = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4]));
         let mut trigger_irq = false;
 
@@ -184,7 +210,7 @@ impl VirtioBlock {
             _ => {}
         }
         
-        trigger_irq
+        Ok(trigger_irq)
     }
 
     fn set_low(&self, mutex: &Mutex<u64>, val: u32) {
@@ -197,9 +223,9 @@ impl VirtioBlock {
         *g = (*g & 0x00000000FFFFFFFF) | ((val as u64) << 32);
     }
 
-    // ========================================================================
-    // DATA PLANE
-    // ========================================================================
+    
+    
+    
     
     fn process_queue(&self, mem: &mut GuestMemory) -> bool {
         let queue_size = *self.queue_num.lock().unwrap() as u16;
@@ -211,7 +237,7 @@ impl VirtioBlock {
         let avail_addr = *self.queue_avail.lock().unwrap();
         let used_addr = *self.queue_used.lock().unwrap();
 
-        // Read avail->idx
+        
         let avail_idx = match mem.read_slice(avail_addr as usize + 2, 2) {
             Ok(bytes) => u16::from_le_bytes([bytes[0], bytes[1]]),
             Err(_) => return false,
@@ -220,7 +246,7 @@ impl VirtioBlock {
         let mut last_idx = self.last_avail_idx.lock().unwrap();
         let mut work_done = false;
 
-        // Process pending requests
+        
         while *last_idx != avail_idx {
             let ring_offset = 4 + (*last_idx % queue_size) as usize * 2;
             let head_idx = match mem.read_slice(avail_addr as usize + ring_offset, 2) {
@@ -230,7 +256,7 @@ impl VirtioBlock {
 
             let written = self.process_descriptor_chain(mem, desc_addr, head_idx);
 
-            // Update used ring
+            
             let used_idx = match mem.read_slice(used_addr as usize + 2, 2) {
                 Ok(bytes) => u16::from_le_bytes([bytes[0], bytes[1]]),
                 Err(_) => 0,
@@ -261,7 +287,7 @@ impl VirtioBlock {
         let mut data_addr = 0u64;
         let mut data_len = 0u32;
         let mut status_addr = 0u64;
-        let mut phase = 0; // 0=header, 1=data, 2=status
+        let mut phase = 0; 
 
         loop {
             let desc_offset = desc_table as usize + (next_idx as usize * 16);
@@ -277,7 +303,7 @@ impl VirtioBlock {
 
             match phase {
                 0 => {
-                    // Header: type(4), reserved(4), sector(8)
+                    
                     if let Ok(header) = mem.read_slice(addr as usize, 16.min(len as usize)) {
                         if header.len() >= 16 {
                             let type_ = u32::from_le_bytes(header[0..4].try_into().unwrap());
@@ -289,11 +315,11 @@ impl VirtioBlock {
                 },
                 1 => {
                     if (flags & VRING_DESC_F_NEXT) != 0 {
-                        // Data descriptor
+                        
                         data_addr = addr;
                         data_len = len;
                     } else {
-                        // Status descriptor (last one)
+                        
                         status_addr = addr;
                         phase = 2;
                     }
@@ -307,7 +333,7 @@ impl VirtioBlock {
             next_idx = next;
         }
 
-        // Perform I/O
+        
         if data_addr != 0 && data_len > 0 {
             let offset = sector * 512;
             let mut disk = self.disk.lock().unwrap();
@@ -330,7 +356,7 @@ impl VirtioBlock {
             }
         }
 
-        // Write status
+        
         if status_addr != 0 {
             let _ = mem.write_u8(status_addr as usize, VIRTIO_BLK_S_OK);
             total_written += 1;
@@ -342,6 +368,6 @@ impl VirtioBlock {
 
 impl Default for VirtioBlock {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
