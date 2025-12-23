@@ -1,4 +1,8 @@
-// main.rs
+// src/main.rs - AxVM v0.7 Storage Edition
+//!
+//! AxVM Hypervisor - VirtIO Block Device Support
+//!
+
 mod memory;
 mod vcpu;
 mod error;
@@ -6,62 +10,32 @@ mod metrics;
 mod serial;
 mod linux;
 mod loader;
+mod acpi;
+mod virtio;
 
-use kvm_ioctls::{Kvm, VmFd, VcpuFd, Cap};
-use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
-use std::time::{Duration, Instant};
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use kvm_ioctls::{Kvm, VcpuFd};
+use kvm_bindings::{KVM_MAX_CPUID_ENTRIES, kvm_pit_config, KVM_PIT_SPEAKER_DUMMY};
+use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
 
 use crate::memory::GuestMemory;
 use crate::error::{AxvmError, AxvmResult};
 use crate::metrics::VmMetrics;
 use crate::serial::SerialConsole;
+use crate::virtio::VirtioBlock;
 
 // ============================================================================
 // CONSTANTS
 // ============================================================================
 
-/// Guest payload: Prints "Hello from AxVM! The silicon obeys.\n" via serial
-///
-/// Assembly:
-///   mov dx, 0x3f8
-///   lea rsi, [rip + string]
-/// loop:
-///   lodsb
-///   test al, al
-///   jz halt
-///   out dx, al
-///   jmp loop
-/// halt:
-///   hlt
-///   jmp halt
-/// string: db "Hello from AxVM! The silicon obeys.", 0x0a, 0x00
-const GUEST_CODE: &[u8] = &[
-    // --- Código ---
-    0x66, 0xba, 0xf8, 0x03,           // mov dx, 0x3f8
-    0x48, 0x8d, 0x35, 0x09, 0x00, 0x00, 0x00, // lea rsi, [rip+9]
-    0xac,                             // lodsb
-    0x84, 0xc0,                       // test al, al
-    0x74, 0x05,                       // jz halt
-    0xee,                             // out dx, al
-    0xeb, 0xf8,                       // jmp loop
-    0xf4,                             // hlt
-
-    // --- STRING PURA ---
-    b'H', b'e', b'l', b'l', b'o', b' ',
-    b'f', b'r', b'o', b'm', b' ',
-    b'A', b'x', b'V', b'M', b'!',
-    b' ', b'T', b'h', b'e', b' ',
-    b's', b'i', b'l', b'i', b'c', b'o', b'n', b' ',
-    b'o', b'b', b'e', b'y', b's', b'.',
-    b'\n', 0x00,
-];
-
-
 const DEFAULT_MEM_SIZE: usize = 1024 * 1024 * 1024; // 1GB
-const MAX_ITERATIONS: u64 = 1_000_000_000;   // 1 billion iterations for kernel boot
-const VCPU_TIMEOUT: Duration = Duration::from_secs(120); // 2 minutes for nested virt
+const DEFAULT_VCPU_COUNT: u8 = 1; // Temporarily 1 for disk testing
+
+// VirtIO-MMIO memory region (in device hole, outside guest RAM)
+const VIRTIO_MMIO_BASE: u64 = 0xFEB00000; // Device memory hole
+const VIRTIO_MMIO_SIZE: u64 = 0x1000;     // 4KB
 
 // ============================================================================
 // CONFIGURATION
@@ -70,13 +44,8 @@ const VCPU_TIMEOUT: Duration = Duration::from_secs(120); // 2 minutes for nested
 #[derive(Debug, Clone)]
 pub struct VmConfig {
     pub mem_size: usize,
-    pub vcpu_count: u32,
-    pub enable_metrics: bool,
-    pub max_iterations: u64,
-    pub timeout: Duration,
-    /// Path to Linux kernel bzImage (None = use embedded payload)
+    pub vcpu_count: u8,
     pub kernel_path: Option<String>,
-    /// Kernel command line
     pub kernel_cmdline: String,
 }
 
@@ -84,601 +53,245 @@ impl Default for VmConfig {
     fn default() -> Self {
         Self {
             mem_size: DEFAULT_MEM_SIZE,
-            vcpu_count: 1,
-            enable_metrics: true,
-            max_iterations: MAX_ITERATIONS,
-            timeout: VCPU_TIMEOUT,
-            // Load Linux kernel by default
+            vcpu_count: DEFAULT_VCPU_COUNT,
             kernel_path: Some("bzImage".to_string()),
-            kernel_cmdline: String::from("console=ttyS0 earlyprintk=serial reboot=k panic=1"),
+            // Added: tsc=unstable clocksource=jiffies to bypass TSC issues
+            kernel_cmdline: String::from(
+                "console=ttyS0 earlyprintk=serial reboot=k panic=1 nokaslr nox2apic \
+                 tsc=unstable clocksource=jiffies \
+                 virtio_mmio.device=4K@0xFEB00000:5 root=/dev/vda"
+            ),
         }
     }
 }
 
 // ============================================================================
-// VM STATE MACHINE
+// VCPU RUNNER
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VmState {
-    Created,
-    Initialized,
-    Running,
-    Paused,
-    Stopped,
-    Failed,
-}
-
-// ============================================================================
-// OWNED VM EXIT (Fixes Borrow Checker Issues)
-// ============================================================================
-
-// Esta struct é crucial. Ela "copia" os dados do VcpuExit (que tem referência)
-// para uma estrutura que é dona dos dados (Owned).
-// Isso permite liberar o empréstimo do vCPU antes de chamar handle_exit.
-#[derive(Debug)]
-pub enum OwnedVmExit {
-    IoIn(u16, Vec<u8>),
-    IoOut(u16, Vec<u8>),
-    MmioRead(u64, Vec<u8>),
-    MmioWrite(u64, Vec<u8>),
-    Hlt,
-    Shutdown,
-    FailEntry(u64, u32),
-    InternalError,
-    SystemEvent(u32, Vec<u64>),
-    Unknown,
-}
-
-// ============================================================================
-// VIRTUAL MACHINE
-// ============================================================================
-
-pub struct VirtualMachine {
-    #[allow(dead_code)]
-    kvm: Kvm,
-    #[allow(dead_code)]
-    vm: VmFd,
+fn run_vcpu(
     vcpu: VcpuFd,
-    #[allow(dead_code)]
-    guest_mem: GuestMemory,
-    config: VmConfig,
-    state: VmState,
-    metrics: Arc<VmMetrics>,
-    should_stop: Arc<AtomicBool>,
-    iteration_count: AtomicU64,
+    cpu_id: u8,
     serial: Arc<SerialConsole>,
-}
-
-impl VirtualMachine {
-    /// Creates a new VM instance
-    pub fn new(config: VmConfig) -> AxvmResult<Self> {
-        log_info("Initializing AxVM Hypervisor...");
-
-        // Initialize KVM
-        let kvm = Kvm::new()
-            .map_err(|e| AxvmError::KvmInit(format!("Failed to open /dev/kvm: {}", e)))?;
-
-        // Sanity checks
-        Self::verify_kvm_capabilities(&kvm)?;
-
-        // Create VM
-        let vm = kvm.create_vm()
-            .map_err(|e| AxvmError::VmCreation(format!("Failed to create VM: {}", e)))?;
-
-        // Allocate guest memory
-        let mut guest_mem = GuestMemory::new(config.mem_size)
-            .map_err(|e| AxvmError::MemoryAllocation(format!("Failed to allocate memory: {}", e)))?;
-
-        // Load guest code (Agora funciona porque write_slice retorna Result)
-        guest_mem.write_slice(0x0, GUEST_CODE)
-            .map_err(|e| AxvmError::MemoryWrite(format!("Failed to write guest code: {}", e)))?;
-
-        // Setup memory region
-        let mem_region = kvm_bindings::kvm_userspace_memory_region {
-            slot: 0,
-            guest_phys_addr: 0,
-            memory_size: config.mem_size as u64,
-            userspace_addr: guest_mem.as_ptr() as u64,
-            flags: 0,
-        };
-
-        unsafe {
-            vm.set_user_memory_region(mem_region)
-                .map_err(|e| AxvmError::MemorySetup(format!("Failed to set memory region: {}", e)))?;
+    virtio: Arc<VirtioBlock>,
+    should_stop: Arc<AtomicBool>,
+    mem_ptr: usize,
+    mem_len: usize,
+) {
+    let mut vcpu = vcpu;
+    let mut local_mem = std::mem::ManuallyDrop::new(
+        unsafe { GuestMemory::from_raw_parts(mem_ptr, mem_len) }
+    );
+    
+    loop {
+        if should_stop.load(Ordering::Relaxed) { 
+            break; 
         }
 
-        log_success(&format!("Guest memory: {} bytes at {:#x}", 
-            config.mem_size, guest_mem.as_ptr() as u64));
-
-        // Create vCPU
-        let mut vcpu = vm.create_vcpu(0)
-            .map_err(|e| AxvmError::VcpuCreation(format!("Failed to create vCPU: {}", e)))?;
-
-        // Setup CPUID (CRITICAL for 64-bit support)
-        Self::setup_cpuid(&kvm, &mut vcpu)?;
-
-        // Load guest code - either embedded payload or Linux kernel
-        let entry_point = if let Some(ref kernel_path) = config.kernel_path {
-            // Load Linux kernel - returns the 32-bit entry point
-            loader::load_linux(
-                &mut guest_mem,
-                kernel_path,
-                config.mem_size,
-                &config.kernel_cmdline,
-            ).map_err(|e| AxvmError::MemoryWrite(format!("Kernel load failed: {}", e)))?
-        } else {
-            // Load embedded payload
-            guest_mem.write_slice(0x0, GUEST_CODE)
-                .map_err(|e| AxvmError::MemoryWrite(format!("Failed to write guest code: {}", e)))?;
-            0x0
-        };
-
-        // Setup CPU mode based on boot type
-        if config.kernel_path.is_some() {
-            // Linux bzImage: 32-bit protected mode (kernel decompressor expects this)
-            vcpu::setup_protected_mode_32bit(
-                &mut vcpu,
-                &mut guest_mem,
-                entry_point,
-                linux::ZERO_PAGE_START as u64,
-            ).map_err(|e| AxvmError::LongModeSetup(format!("Failed to setup 32-bit mode: {}", e)))?;
-
-            // Debug: verify initial state
-            if let Ok(regs) = vcpu.get_regs() {
-                log_info(&format!("Initial: RIP={:#x}, RSP={:#x}, RSI={:#x}", 
-                    regs.rip, regs.rsp, regs.rsi));
-            }
-            if let Ok(sregs) = vcpu.get_sregs() {
-                log_info(&format!("Initial: CR0={:#x}, CR3={:#x}, CR4={:#x}, EFER={:#x}",
-                    sregs.cr0, sregs.cr3, sregs.cr4, sregs.efer));
-            }
-
-            log_success("32-bit protected mode initialized (Linux boot)");
-        } else {
-            // Embedded payload: 64-bit long mode
-            vcpu::setup_long_mode_with_entry(&mut vcpu, &mut guest_mem, entry_point)
-                .map_err(|e| AxvmError::LongModeSetup(format!("Failed to setup long mode: {}", e)))?;
-            log_success("64-bit long mode initialized");
-        }
-
-        let metrics = if config.enable_metrics {
-            Arc::new(VmMetrics::new())
-        } else {
-            Arc::new(VmMetrics::disabled())
-        };
-
-        let serial = Arc::new(SerialConsole::new());
-
-        Ok(Self {
-            kvm,
-            vm,
-            vcpu,
-            guest_mem,
-            config,
-            state: VmState::Initialized,
-            metrics,
-            should_stop: Arc::new(AtomicBool::new(false)),
-            iteration_count: AtomicU64::new(0),
-            serial,
-        })
-    }
-
-    /// Verifies KVM capabilities
-    fn verify_kvm_capabilities(kvm: &Kvm) -> AxvmResult<()> {
-        let api_version = kvm.get_api_version();
-        
-        if api_version != 12 {
-            return Err(AxvmError::KvmVersion(
-                format!("Unsupported KVM API version: {} (expected 12)", api_version)
-            ));
-        }
-
-        log_info(&format!("KVM API Version: {}", api_version));
-
-        // Check required capabilities - CORRIGIDO para usar Cap enum
-        // KVM ioctls 0.19+ usa Cap enum e retorna bool
-        if !kvm.check_extension(Cap::UserMemory) {
-            return Err(AxvmError::MissingCapability("UserMemory".to_string()));
-        }
-        if !kvm.check_extension(Cap::SetTssAddr) {
-            return Err(AxvmError::MissingCapability("SetTssAddr".to_string()));
-        }
-
-        log_success("KVM capabilities verified");
-        Ok(())
-    }
-
-    /// Setup CPUID for 64-bit support
-    fn setup_cpuid(kvm: &Kvm, vcpu: &mut VcpuFd) -> AxvmResult<()> {
-        let kvm_cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
-            .map_err(|e| AxvmError::CpuidSetup(format!("Failed to get supported CPUID: {}", e)))?;
-
-        vcpu.set_cpuid2(&kvm_cpuid)
-            .map_err(|e| AxvmError::CpuidSetup(format!("Failed to set CPUID: {}", e)))?;
-
-        log_success("CPUID configured (64-bit support enabled)");
-        Ok(())
-    }
-
-    /// Runs the VM
-    pub fn run(&mut self) -> AxvmResult<VmExitReason> {
-        if self.state != VmState::Initialized && self.state != VmState::Paused {
-            return Err(AxvmError::InvalidState(
-                format!("Cannot run VM in state: {:?}", self.state)
-            ));
-        }
-
-        self.state = VmState::Running;
-        log_info("Starting VM execution...");
-
-        let start_time = Instant::now();
-        let timeout = self.config.timeout;
-
-        loop {
-            // Check timeout
-            if start_time.elapsed() > timeout {
-                self.state = VmState::Failed;
-                return Err(AxvmError::Timeout(
-                    format!("VM execution timeout after {:?}", timeout)
-                ));
-            }
-
-            // Check stop signal
-            if self.should_stop.load(Ordering::Relaxed) {
-                self.state = VmState::Stopped;
-                return Ok(VmExitReason::Stopped);
-            }
-
-            // Check iteration limit
-            let iterations = self.iteration_count.fetch_add(1, Ordering::Relaxed);
-            if iterations >= self.config.max_iterations {
-                self.state = VmState::Failed;
-                return Err(AxvmError::MaxIterations(
-                    format!("Exceeded maximum iterations: {}", self.config.max_iterations)
-                ));
-            }
-
-            // Run vCPU
-            self.metrics.record_vcpu_run();
-            
-            // CORREÇÃO CRÍTICA DE LIFETIMES
-            // 1. Executamos o vCPU
-            // 2. Convertemos a saída para OwnedVmExit (copiando dados)
-            // 3. O escopo do borrow do vCPU termina
-            // 4. Chamamos handle_exit (que pede &mut self)
-            
-            let exit_reason = match self.vcpu.run() {
-                Ok(exit) => {
-                    match exit {
-                        kvm_ioctls::VcpuExit::IoIn(port, data) => {
-                            // Handle IO reads inline to write response
-                            if port >= serial::COM1_BASE && port < serial::COM1_BASE + 8 {
-                                let value = self.serial.read(port);
-                                if !data.is_empty() {
-                                    data[0] = value;
-                                }
-                            }
-                            OwnedVmExit::IoIn(port, data.to_vec())
-                        },
-                        kvm_ioctls::VcpuExit::IoOut(port, data) => OwnedVmExit::IoOut(port, data.to_vec()),
-                        kvm_ioctls::VcpuExit::Hlt => OwnedVmExit::Hlt,
-                        kvm_ioctls::VcpuExit::Shutdown => OwnedVmExit::Shutdown,
-                        kvm_ioctls::VcpuExit::FailEntry(r, c) => OwnedVmExit::FailEntry(r, c),
-                        kvm_ioctls::VcpuExit::InternalError => OwnedVmExit::InternalError,
-                        kvm_ioctls::VcpuExit::SystemEvent(t, f) => OwnedVmExit::SystemEvent(t, f.to_vec()),
-                        _ => OwnedVmExit::Unknown,
+        match vcpu.run() {
+            Ok(exit) => match exit {
+                kvm_ioctls::VcpuExit::IoOut(port, data) => {
+                    if port >= 0x3F8 && port < 0x3F8 + 8 {
+                        serial.write(port, &data);
                     }
                 },
-                Err(e) => {
-                    self.metrics.record_error();
-                    self.state = VmState::Failed;
-                    return Err(AxvmError::VcpuRuntime(
-                        format!("vCPU execution error: {:?}", e)
-                    ));
-                }
-            };
-
-            // Agora podemos chamar handle_exit porque self.vcpu não está mais "emprestado"
-            match self.handle_exit(exit_reason)? {
-                ExitAction::Continue => continue,
-                ExitAction::Stop(reason) => {
-                    self.state = VmState::Stopped;
-                    return Ok(reason);
-                }
-            }
-        }
-    }
-
-    /// Handles VM exit reasons
-    fn handle_exit(&mut self, exit: OwnedVmExit) -> AxvmResult<ExitAction> {
-        match exit {
-            OwnedVmExit::IoOut(port, data) => {
-                self.metrics.record_io_exit();
-                self.handle_io_out(port, &data)
-            }
-
-            OwnedVmExit::IoIn(port, data) => {
-                self.metrics.record_io_exit();
-                
-                // Handle serial port reads
-                if port >= serial::COM1_BASE && port < serial::COM1_BASE + 8 {
-                    let value = self.serial.read(port);
-                    // Write response back to vCPU
-                    // The data slice contains the buffer where we write the response
-                    if !data.is_empty() {
-                        // We need to write to vCPU's data buffer via MMIO
-                        // For IO_IN, we write the response to guest via vcpu
-                        // Actually, KVM expects us to NOT modify data here directly
-                        // Instead, we set it via the vcpu set_data method or similar
-                        // For now, the kernel will continue if we just return
+                kvm_ioctls::VcpuExit::IoIn(port, data) => {
+                    if port >= 0x3F8 && port < 0x3F8 + 8 {
+                        let value = serial.read(port);
+                        if !data.is_empty() {
+                            data[0] = value;
+                        }
                     }
+                },
+                // VirtIO MMIO interception
+                kvm_ioctls::VcpuExit::MmioRead(addr, data) => {
+                    if addr >= VIRTIO_MMIO_BASE && addr < VIRTIO_MMIO_BASE + VIRTIO_MMIO_SIZE {
+                        virtio.read(addr - VIRTIO_MMIO_BASE, data);
+                    }
+                },
+                kvm_ioctls::VcpuExit::MmioWrite(addr, data) => {
+                    if addr >= VIRTIO_MMIO_BASE && addr < VIRTIO_MMIO_BASE + VIRTIO_MMIO_SIZE {
+                        let _ = virtio.write(addr - VIRTIO_MMIO_BASE, data, &mut *local_mem);
+                        // IRQ injection disabled for now - Linux uses polling
+                    }
+                },
+                kvm_ioctls::VcpuExit::Hlt => {
+                    if should_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                },
+                kvm_ioctls::VcpuExit::Shutdown => {
+                    println!("\n>>> [CPU {}] SHUTDOWN!", cpu_id);
+                    should_stop.store(true, Ordering::Relaxed);
+                    break;
+                },
+                _ => {}
+            },
+            Err(_) => {
+                if should_stop.load(Ordering::Relaxed) {
+                    break;
                 }
-                Ok(ExitAction::Continue)
-            }
-
-            OwnedVmExit::Hlt => {
-                log_success("Guest executed HLT instruction");
-                Ok(ExitAction::Stop(VmExitReason::Halted))
-            }
-
-            OwnedVmExit::Shutdown => {
-                // Debug: dump registers to see where kernel crashed
-                if let Ok(regs) = self.vcpu.get_regs() {
-                    log_info(&format!("Shutdown at RIP={:#x}, RSP={:#x}, RSI={:#x}", 
-                        regs.rip, regs.rsp, regs.rsi));
-                    log_info(&format!("RAX={:#x}, RBX={:#x}, RCX={:#x}, RDX={:#x}",
-                        regs.rax, regs.rbx, regs.rcx, regs.rdx));
-                }
-                if let Ok(sregs) = self.vcpu.get_sregs() {
-                    log_info(&format!("CR0={:#x}, CR3={:#x}, CR4={:#x}, EFER={:#x}",
-                        sregs.cr0, sregs.cr3, sregs.cr4, sregs.efer));
-                }
-                log_info("Guest initiated shutdown (Triple Fault)");
-                Ok(ExitAction::Stop(VmExitReason::Shutdown))
-            }
-
-            OwnedVmExit::FailEntry(reason, cpu) => {
-                self.metrics.record_error();
-                log_error(&format!("Hardware VM-Entry failure: reason={}, cpu={}", reason, cpu));
-                
-                // Try to dump CPU state for debugging
-                if let Ok(regs) = self.vcpu.get_regs() {
-                    log_error(&format!("CPU State: RIP={:#x}, RSP={:#x}, RFLAGS={:#x}",
-                        regs.rip, regs.rsp, regs.rflags));
-                }
-                
-                Err(AxvmError::HardwareFailure(
-                    format!("VM-Entry failed: reason={}, cpu={}", reason, cpu)
-                ))
-            }
-
-            OwnedVmExit::InternalError => {
-                self.metrics.record_error();
-                Err(AxvmError::InternalError(
-                    "KVM internal error occurred".to_string()
-                ))
-            }
-
-            OwnedVmExit::SystemEvent(event_type, flags) => {
-                // CORRIGIDO: flags agora é Vec<u64>, usamos {:?} para formatar
-                log_info(&format!("System event: type={}, flags={:?}", event_type, flags));
-                Ok(ExitAction::Stop(VmExitReason::SystemEvent))
-            }
-
-            _ => {
-                log_debug("Unhandled exit");
-                Ok(ExitAction::Continue)
+                thread::sleep(Duration::from_micros(100));
             }
         }
     }
-
-    /// Handles IO OUT operations
-    fn handle_io_out(&mut self, port: u16, data: &[u8]) -> AxvmResult<ExitAction> {
-        // Serial port range: 0x3F8 - 0x3FF (COM1)
-        if port >= serial::COM1_BASE && port < serial::COM1_BASE + 8 {
-            self.serial.write(port, data);
-            return Ok(ExitAction::Continue);
-        }
-
-        log_debug(&format!("IO OUT: port={:#x}, data={:?}", port, data));
-        Ok(ExitAction::Continue)
-    }
-
-    /// Signals VM to stop
-    pub fn stop(&self) {
-        self.should_stop.store(true, Ordering::Relaxed);
-    }
-
-    /// Returns current VM state
-    pub fn state(&self) -> VmState {
-        self.state
-    }
-
-    /// Returns VM metrics
-    pub fn metrics(&self) -> &VmMetrics {
-        &self.metrics
-    }
-
-    /// Returns iteration count
-    pub fn iterations(&self) -> u64 {
-        self.iteration_count.load(Ordering::Relaxed)
-    }
-
-    /// Returns a cloneable handle to signal VM stop
-    pub fn stop_handle(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.should_stop)
-    }
 }
 
 // ============================================================================
-// EXIT HANDLING
-// ============================================================================
-
-#[derive(Debug)]
-enum ExitAction {
-    Continue,
-    Stop(VmExitReason),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VmExitReason {
-    Success,
-    Halted,
-    Shutdown,
-    Stopped,
-    SystemEvent,
-    ValidationFailed,
-}
-
-// ============================================================================
-// LOGGING UTILITIES
-// ============================================================================
-
-fn log_info(msg: &str) {
-    println!(">>> [INFO] {}", msg);
-}
-
-fn log_success(msg: &str) {
-    println!(">>> [✓] {}", msg);
-}
-
-fn log_error(msg: &str) {
-    eprintln!(">>> [ERROR] {}", msg);
-}
-
-fn log_debug(msg: &str) {
-    if std::env::var("AXVM_DEBUG").is_ok() {
-        println!(">>> [DEBUG] {}", msg);
-    }
-}
-
-// ============================================================================
-// MAIN ENTRY POINT
+// MAIN
 // ============================================================================
 
 fn main() -> AxvmResult<()> {
     println!("╔════════════════════════════════════════════════════════════════╗");
-    println!("║                  AxVM Hypervisor v0.3                          ║");
-    println!("║              Production-Grade KVM Virtualization               ║");
+    println!("║              AxVM Hypervisor v0.7                              ║");
+    println!("║          Storage Edition - VirtIO Block 💾                     ║");
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!();
 
-    // Check for kernel path argument (overrides default if provided)
-    let args: Vec<String> = std::env::args().collect();
-    
-    let config = if let Some(kernel_arg) = args.get(1) {
-        VmConfig {
-            kernel_path: Some(kernel_arg.clone()),
-            timeout: Duration::from_secs(30),
-            ..Default::default()
-        }
-    } else {
-        VmConfig {
-            timeout: Duration::from_secs(30),
-            ..Default::default()
-        }
-    };
+    let config = VmConfig::default();
     
     println!("Configuration:");
-    println!("  Memory Size:     {} bytes ({} MB)", config.mem_size, config.mem_size / (1024 * 1024));
-    println!("  vCPU Count:      {}", config.vcpu_count);
-    println!("  Max Iterations:  {}", config.max_iterations);
-    println!("  Timeout:         {:?}", config.timeout);
-    if let Some(ref path) = config.kernel_path {
-        println!("  Kernel:          {}", path);
-        println!("  Cmdline:         {}", config.kernel_cmdline);
+    println!("  Memory:   {} MB", config.mem_size / (1024 * 1024));
+    println!("  vCPUs:    {}", config.vcpu_count);
+    println!("  Kernel:   {:?}", config.kernel_path);
+    println!("  VirtIO:   Block @ {:#x}", VIRTIO_MMIO_BASE);
+    println!();
+
+    // Initialize KVM
+    let kvm = Kvm::new()
+        .map_err(|e| AxvmError::KvmInit(e.to_string()))?;
+    println!(">>> [INFO] KVM API Version: {}", kvm.get_api_version());
+    
+    let vm = kvm.create_vm()
+        .map_err(|e| AxvmError::VmCreation(e.to_string()))?;
+
+    // Create IRQCHIP
+    vm.create_irq_chip()
+        .map_err(|e| AxvmError::VmCreation(format!("IRQ Chip Error: {}", e)))?;
+    println!(">>> [✓] IRQ Chip created");
+
+    // Create PIT Timer
+    let pit_config = kvm_pit_config {
+        flags: KVM_PIT_SPEAKER_DUMMY,
+        ..Default::default()
+    };
+    vm.create_pit2(pit_config)
+        .map_err(|e| AxvmError::VmCreation(format!("PIT Error: {}", e)))?;
+    println!(">>> [✓] PIT Timer created");
+
+    // Allocate Memory
+    let mut guest_mem = GuestMemory::new(config.mem_size)
+        .map_err(|e| AxvmError::MemoryAllocation(e.to_string()))?;
+
+    let mem_region = kvm_bindings::kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: config.mem_size as u64,
+        userspace_addr: guest_mem.as_ptr() as u64,
+        flags: 0,
+    };
+    
+    unsafe {
+        vm.set_user_memory_region(mem_region)
+            .map_err(|e| AxvmError::MemorySetup(e.to_string()))?;
+    }
+    println!(">>> [✓] Guest memory: {} MB", config.mem_size / (1024 * 1024));
+
+    // Generate ACPI Tables
+    acpi::setup_acpi(&mut guest_mem, config.vcpu_count)
+        .map_err(|e| AxvmError::MemoryWrite(format!("ACPI Error: {}", e)))?;
+
+    // Load Kernel
+    let entry_point = if let Some(ref path) = config.kernel_path {
+        let ep = loader::load_linux(
+            &mut guest_mem, 
+            path, 
+            config.mem_size, 
+            &config.kernel_cmdline
+        ).map_err(|e| AxvmError::InternalError(e))?;
+        
+        println!(">>> [✓] Kernel loaded. Entry: {:#x}", ep);
+        ep
     } else {
-        println!("  Mode:            Embedded payload");
-    }
-    println!();
+        0x100000
+    };
 
-    let start_time = Instant::now();
-
-    // CORREÇÃO: clone() na config
-    let mut vm = VirtualMachine::new(config.clone())?;
-
-    // Setup Ctrl+C handler for graceful shutdown
-    let stop_handle = vm.stop_handle();
-    ctrlc::set_handler(move || {
-        println!();
-        log_info("Received interrupt signal (Ctrl+C). Stopping VM gracefully...");
-        stop_handle.store(true, Ordering::Relaxed);
-    }).expect("Failed to set Ctrl+C handler");
-
-    log_info("Press Ctrl+C to stop the VM gracefully");
-    println!();
-    
-    let result = vm.run();
-    
-    let elapsed = start_time.elapsed();
-
-    println!();
-    println!("╔════════════════════════════════════════════════════════════════╗");
-    println!("║                      Execution Summary                         ║");
-    println!("╠════════════════════════════════════════════════════════════════╣");
-    
-    match result {
-        Ok(reason) => {
-            println!("║  Status:         SUCCESS                                      ║");
-            println!("║  Exit Reason:    {:?}                                    ║", reason);
-        }
-        Err(ref e) => {
-            println!("║  Status:         FAILED                                       ║");
-            println!("║  Error:          {}                              ║", e);
-        }
-    }
-    
-    println!("║  State:          {:?}                                    ║", vm.state());
-    println!("║  Iterations:     {}                                        ║", vm.iterations());
-    println!("║  Elapsed Time:   {:?}                                    ║", elapsed);
-    
-    if config.enable_metrics {
-        let metrics = vm.metrics();
-        println!("╠════════════════════════════════════════════════════════════════╣");
-        println!("║                          Metrics                               ║");
-        println!("╠════════════════════════════════════════════════════════════════╣");
-        println!("║  vCPU Runs:      {}                                        ║", metrics.vcpu_runs());
-        println!("║  IO Exits:       {}                                         ║", metrics.io_exits());
-        println!("║  Errors:         {}                                          ║", metrics.errors());
-    }
-    
-    println!("╚════════════════════════════════════════════════════════════════╝");
-
-    result.map(|_| ())
-}
-
-// ============================================================================
-// TESTS
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_vm_creation() {
-        let config = VmConfig::default();
-        let vm = VirtualMachine::new(config);
-        assert!(vm.is_ok());
-    }
-
-    #[test]
-    fn test_vm_state_transitions() {
-        let config = VmConfig::default();
-        let mut vm = VirtualMachine::new(config).unwrap();
-        assert_eq!(vm.state(), VmState::Initialized);
+    // Create vCPUs
+    let mut vcpus = Vec::new();
+    for cpu_id in 0..config.vcpu_count {
+        let mut vcpu = vm.create_vcpu(cpu_id as u64)
+            .map_err(|e| AxvmError::VcpuCreation(e.to_string()))?;
         
-        let _ = vm.run();
-        assert!(vm.state() == VmState::Stopped || vm.state() == VmState::Failed);
+        let kvm_cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+            .map_err(|e| AxvmError::CpuidSetup(e.to_string()))?;
+        vcpu.set_cpuid2(&kvm_cpuid)
+            .map_err(|e| AxvmError::CpuidSetup(e.to_string()))?;
+        
+        vcpu::setup_long_mode(&mut vcpu, &mut guest_mem, entry_point, 0x7000)
+            .map_err(|e| AxvmError::LongModeSetup(e.to_string()))?;
+        
+        vcpus.push(vcpu);
+    }
+    println!(">>> [✓] Created {} vCPUs", config.vcpu_count);
+
+    // Initialize VirtIO Block Device
+    let virtio_blk = Arc::new(VirtioBlock::new());
+
+    // Shared state
+    let should_stop = Arc::new(AtomicBool::new(false));
+    let serial = Arc::new(SerialConsole::new());
+    let _metrics = Arc::new(VmMetrics::new());
+
+    println!(">>> [Run] Spawning {} vCPU threads...", config.vcpu_count);
+    println!();
+
+    // Spawn threads
+    let mut handles = Vec::new();
+    let thread_ids: Arc<std::sync::Mutex<Vec<libc::pthread_t>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    
+    // Get memory pointers for threads
+    let mem_ptr = guest_mem.as_ptr() as usize;
+    let mem_len = guest_mem.len();
+
+    for (cpu_id, vcpu) in vcpus.into_iter().enumerate() {
+        let serial = Arc::clone(&serial);
+        let virtio = Arc::clone(&virtio_blk);
+        let should_stop = Arc::clone(&should_stop);
+        let thread_ids_clone = Arc::clone(&thread_ids);
+        
+        let handle = thread::spawn(move || {
+            {
+                let mut ids = thread_ids_clone.lock().unwrap();
+                ids.push(unsafe { libc::pthread_self() });
+            }
+            run_vcpu(vcpu, cpu_id as u8, serial, virtio, should_stop, mem_ptr, mem_len);
+        });
+        handles.push(handle);
     }
 
-    #[test]
-    fn test_vm_stop_signal() {
-        let config = VmConfig::default();
-        let vm = VirtualMachine::new(config).unwrap();
+    // Wait for threads to register
+    thread::sleep(Duration::from_millis(100));
+
+    // Ctrl+C handler
+    let stop_handle = Arc::clone(&should_stop);
+    let thread_ids_for_signal = Arc::clone(&thread_ids);
+    ctrlc::set_handler(move || { 
+        println!("\n>>> [Signal] Ctrl+C received, stopping...");
+        stop_handle.store(true, Ordering::SeqCst);
         
-        vm.stop();
-        assert!(vm.should_stop.load(Ordering::Relaxed));
+        if let Ok(ids) = thread_ids_for_signal.lock() {
+            for &tid in ids.iter() {
+                unsafe { libc::pthread_kill(tid, libc::SIGUSR1); }
+            }
+        }
+    }).expect("Ctrl-C handler error");
+
+    // Wait for all threads
+    for h in handles {
+        let _ = h.join();
     }
+
+    println!("\n>>> [Exit] AxVM terminated.");
+    Ok(())
 }

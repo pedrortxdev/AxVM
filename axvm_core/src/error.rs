@@ -3,6 +3,8 @@
 //! Error types and result aliases for AxVM.
 //! Provides comprehensive error handling with severity levels and recoverability hints.
 
+#![allow(dead_code)]
+
 use std::fmt;
 use std::io;
 

@@ -114,17 +114,30 @@ pub fn load_linux(
     ));
 
     // ========================================================================
-    // 2. Configure E820 Memory Map
+    // 2. Configure E820 Memory Map (Split Layout for Linux)
     // ========================================================================
+    // Linux expects a hole at 0xA0000 (640KB) to 0x100000 (1MB) for VGA/BIOS.
+    // Without this split, Linux may reject memory or fail to allocate low pages.
 
-    write_packed!(boot_params, e820_entries, 1u8);
+    write_packed!(boot_params, e820_entries, 2u8);
+
+    // Entry 1: Low Memory (0 - 639KB) - Conventional memory
     boot_params.e820_table[0] = E820Entry {
         addr: 0,
-        size: mem_size as u64,
+        size: 0x9FC00,  // 639KB (just under 640KB)
         type_: E820_RAM,
     };
 
-    log_loader(&format!("E820: RAM 0x0 - {:#x} ({} MB)", mem_size, mem_size / (1024 * 1024)));
+    // Entry 2: High Memory (1MB - End) - Where kernel lives
+    boot_params.e820_table[1] = E820Entry {
+        addr: 0x100000,  // Start at 1MB
+        size: (mem_size - 0x100000) as u64,
+        type_: E820_RAM,
+    };
+
+    log_loader(&format!("E820: Low RAM 0x0 - 0x9FC00 (639 KB)"));
+    log_loader(&format!("E820: High RAM 0x100000 - {:#x} ({} MB)", 
+        mem_size, (mem_size - 0x100000) / (1024 * 1024)));
 
     // ========================================================================
     // 3. Configure Kernel Command Line

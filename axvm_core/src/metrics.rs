@@ -1,4 +1,6 @@
 // metrics.rs
+#![allow(dead_code)]
+
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use std::fmt;

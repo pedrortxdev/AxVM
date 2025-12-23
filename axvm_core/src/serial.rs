@@ -4,21 +4,16 @@
 //!
 
 use std::io::{self, Write};
-use std::sync::Mutex;
 
 pub const COM1_BASE: u16 = 0x3F8;
 pub const DATA_REGISTER: u16 = 0;
 pub const LINE_STATUS_REGISTER: u16 = 5;
 
-pub struct SerialConsole {
-    buffer: Mutex<Vec<u8>>,
-}
+pub struct SerialConsole;
 
 impl SerialConsole {
     pub fn new() -> Self {
-        Self {
-            buffer: Mutex::new(Vec::new()),
-        }
+        Self
     }
 
     pub fn write(&self, port: u16, data: &[u8]) {

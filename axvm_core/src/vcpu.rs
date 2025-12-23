@@ -30,13 +30,18 @@ const EFER_LMA: u64 = 1 << 10;
 // LONG MODE SETUP
 // ============================================================================
 
-/// Initializes the vCPU for x86-64 long mode operation with entry at 0x0.
+/// Initializes the vCPU for x86-64 long mode operation.
 ///
-/// This is a convenience wrapper around `setup_long_mode_with_entry` for
-/// embedded payloads that start at address 0.
+/// For embedded payloads, use entry_point=0x0, boot_params=0x0.
+/// For Linux kernel, use entry_point=0x100000, boot_params=0x7000.
 #[allow(dead_code)]
-pub fn setup_long_mode(vcpu: &mut VcpuFd, mem: &mut GuestMemory) -> Result<(), Box<dyn std::error::Error>> {
-    setup_long_mode_with_entry(vcpu, mem, 0x0)
+pub fn setup_long_mode(
+    vcpu: &mut VcpuFd, 
+    mem: &mut GuestMemory,
+    entry_point: u64,
+    boot_params: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    setup_protected_mode_32bit(vcpu, mem, entry_point, boot_params)
 }
 
 /// Initializes the vCPU for x86-64 long mode with a custom entry point.
