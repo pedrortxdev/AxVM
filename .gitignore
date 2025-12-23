@@ -1,4 +1,18 @@
-axvm_core/targed/debug
-axvm_core/targed/debug*
-axvm_core/targed/*debug
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
 
+# KVM / Hypervisor Artifacts
+*.img
+*.iso
+*.qcow2
+bzImage
+vmlinux
+initrd*
+disk.img
+
+# IDEs
+.vscode/
+.idea/
+*.swp

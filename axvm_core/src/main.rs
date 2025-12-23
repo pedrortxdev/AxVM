@@ -19,6 +19,7 @@ use std::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 
 use crate::memory::GuestMemory;
 use crate::error::{AxvmError, AxvmResult};
@@ -55,10 +56,9 @@ impl Default for VmConfig {
             mem_size: DEFAULT_MEM_SIZE,
             vcpu_count: DEFAULT_VCPU_COUNT,
             kernel_path: Some("bzImage".to_string()),
-            // Added: tsc=unstable clocksource=jiffies to bypass TSC issues
+            // Added: noapic to force legacy PIC usage since we don't expose IOAPIC in ACPI yet
             kernel_cmdline: String::from(
-                "console=ttyS0 earlyprintk=serial reboot=k panic=1 nokaslr nox2apic \
-                 tsc=unstable clocksource=jiffies \
+                "console=ttyS0 earlyprintk=serial reboot=k panic=1 nokaslr noapic \
                  virtio_mmio.device=4K@0xFEB00000:5 root=/dev/vda"
             ),
         }
@@ -71,6 +71,7 @@ impl Default for VmConfig {
 
 fn run_vcpu(
     vcpu: VcpuFd,
+    vm_fd: Arc<std::sync::Mutex<kvm_ioctls::VmFd>>,
     cpu_id: u8,
     serial: Arc<SerialConsole>,
     virtio: Arc<VirtioBlock>,
@@ -111,15 +112,20 @@ fn run_vcpu(
                 },
                 kvm_ioctls::VcpuExit::MmioWrite(addr, data) => {
                     if addr >= VIRTIO_MMIO_BASE && addr < VIRTIO_MMIO_BASE + VIRTIO_MMIO_SIZE {
-                        let _ = virtio.write(addr - VIRTIO_MMIO_BASE, data, &mut *local_mem);
-                        // IRQ injection disabled for now - Linux uses polling
+                        let irq_needed = virtio.write(addr - VIRTIO_MMIO_BASE, data, &mut *local_mem);
+                        if irq_needed {
+                            // Inject IRQ 5 (as defined in cmdline)
+                            let vm = vm_fd.lock().unwrap();
+                            let _ = vm.set_irq_line(5, true);
+                            let _ = vm.set_irq_line(5, false);
+                        }
                     }
                 },
                 kvm_ioctls::VcpuExit::Hlt => {
                     if should_stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    thread::sleep(Duration::from_millis(10));
+                    thread::yield_now();
                 },
                 kvm_ioctls::VcpuExit::Shutdown => {
                     println!("\n>>> [CPU {}] SHUTDOWN!", cpu_id);
@@ -254,18 +260,22 @@ fn main() -> AxvmResult<()> {
     let mem_ptr = guest_mem.as_ptr() as usize;
     let mem_len = guest_mem.len();
 
+    // Wrap VM for thread sharing
+    let shared_vm = Arc::new(std::sync::Mutex::new(vm));
+
     for (cpu_id, vcpu) in vcpus.into_iter().enumerate() {
         let serial = Arc::clone(&serial);
         let virtio = Arc::clone(&virtio_blk);
         let should_stop = Arc::clone(&should_stop);
         let thread_ids_clone = Arc::clone(&thread_ids);
+        let vm_fd = Arc::clone(&shared_vm);
         
         let handle = thread::spawn(move || {
             {
                 let mut ids = thread_ids_clone.lock().unwrap();
                 ids.push(unsafe { libc::pthread_self() });
             }
-            run_vcpu(vcpu, cpu_id as u8, serial, virtio, should_stop, mem_ptr, mem_len);
+            run_vcpu(vcpu, vm_fd, cpu_id as u8, serial, virtio, should_stop, mem_ptr, mem_len);
         });
         handles.push(handle);
     }
