@@ -37,4 +37,4 @@ linux-6.1.112.tar.xz*
 *linux-6.1.112
 *bzImage-microvm
 *bzImage
-*cloud-hypervisor
+*cloud-hypervisorrootfs.ext4
