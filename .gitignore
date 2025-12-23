@@ -1,1 +1,4 @@
 axvm_core/targed/debug
+axvm_core/targed/debug*
+axvm_core/targed/*debug
+

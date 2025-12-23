@@ -11,26 +11,33 @@ This repository contains the **AxVM-Xv2 profile**, optimized specifically for **
 
 ## Current Status
 
-**✅ Functional x86-64 Long Mode Hypervisor**
+**✅ Functional Hypervisor with Linux Boot and VirtIO Storage**
 
 ```
 ╔════════════════════════════════════════════════════════════════╗
-║                  AxVM Hypervisor v0.3                          ║
-║              Production-Grade KVM Virtualization               ║
+║              AxVM Hypervisor v0.8                              ║
+║          Storage Edition - VirtIO Block 💾                     ║
 ╚════════════════════════════════════════════════════════════════╝
 
->>> [✓] Validation PASSED: RAX=0xcafebabedeadbeef
->>> [✓] ✓ 64-bit Long Mode confirmed
+>>> [VirtIO] disk.img opened successfully
+>>> [Run] Spawning vCPU threads...
+
+[    0.001073] virtio_blk virtio0: [vda] 204800 512-byte logical blocks (105 MB/100 MiB)
+[    0.001073] smpboot: Total of 1 processors activated (5598.97 BogoMIPS)
 ```
 
 The hypervisor successfully:
-- Initializes KVM with capability verification
-- Allocates and maps guest memory via mmap
-- Sets up 4-level page tables (PML4 → PDPT → PD)
-- Configures GDT with 64-bit code/data segments
-- Bootstraps x86-64 long mode (CR0, CR4, EFER)
-- Executes guest code and handles VM exits
-- Validates 64-bit register operations
+- ✅ Initializes KVM with capability verification
+- ✅ Allocates guest memory with Huge Pages (THP) for performance
+- ✅ Sets up 4-level page tables (PML4 → PDPT → PD)
+- ✅ Configures GDT with 64-bit code/data segments
+- ✅ Bootstraps x86-64 long mode (CR0, CR4, EFER)
+- ✅ Generates ACPI tables (RSDP, RSDT, MADT) for SMP
+- ✅ Executes Linux kernel 6.8.0 with boot protocol 2.15
+- ✅ Emulates UART 8250 serial console
+- ✅ Implements VirtIO-MMIO Block Device (100MB vda)
+- ✅ Detects and initializes VirtIO drivers in Linux
+- ✅ Graceful shutdown with signal handling
 
 ---
 
@@ -43,6 +50,11 @@ axvm_core/
     ├── main.rs         # VM lifecycle, exit handling, main loop
     ├── memory.rs       # Guest memory management (mmap, huge pages, protection)
     ├── vcpu.rs         # vCPU setup (long mode, page tables, GDT, registers)
+    ├── loader.rs       # Linux boot (bzImage, Zero Page, E820, cmdline)
+    ├── linux.rs        # Linux boot protocol structures
+    ├── acpi.rs         # ACPI table generator (RSDP, RSDT, MADT for SMP)
+    ├── serial.rs       # UART 8250 serial console emulation
+    ├── virtio.rs       # VirtIO-MMIO Block Device (control + data plane)
     ├── error.rs        # Error types with severity levels
     └── metrics.rs      # Performance metrics collection
 ```
@@ -51,11 +63,14 @@ axvm_core/
 
 | Module | Description |
 |--------|-------------|
-| `VirtualMachine` | Main VM struct with state machine, metrics, and graceful shutdown |
+| `main.rs` | Main VM struct with state machine, metrics, and graceful shutdown |
 | `GuestMemory` | Safe mmap wrapper with bounds checking, huge pages, mlock support |
 | `setup_long_mode` | x86-64 long mode bootstrap (CR0.PG, CR4.PAE, EFER.LME/LMA) |
+| `load_linux` | Loads bzImage, configures Zero Page, E820 memory map, cmdline |
+| `setup_acpi` | Generates RSDP, RSDT, MADT for SMP CPU detection by kernel |
+| `VirtioBlock` | VirtIO-MMIO device for storage with queue processing |
+| `SerialConsole` | UART 8250 emulator for Linux console output |
 | `AxvmError` | Comprehensive error types with severity and recoverability hints |
-| `VmMetrics` | Atomic counters for vCPU runs, IO exits, errors |
 
 ---
 
@@ -66,11 +81,15 @@ axvm_core/
 cd axvm_core
 cargo build --release
 
+# Create virtual disk (100MB)
+dd if=/dev/zero of=disk.img bs=1M count=100
+mkfs.ext4 disk.img  # Optional: format as EXT4
+
+# Copy Linux kernel
+cp /boot/vmlinuz-$(uname -r) bzImage
+
 # Run (requires /dev/kvm access)
 cargo run
-
-# Run with debug output
-AXVM_DEBUG=1 cargo run
 ```
 
 ### Requirements
@@ -78,15 +97,16 @@ AXVM_DEBUG=1 cargo run
 - Linux with KVM support (`/dev/kvm`)
 - Rust 1.70+ (2021 edition)
 - Intel VT-x or AMD-V enabled in BIOS
+- Linux kernel bzImage for boot
 
 ---
 
 ## Why Ivy Bridge Xeon v2?
 
 The Xeon E5-2680 v2 represents a class of CPUs that are still widely deployed:
-- Many cores / threads
-- Lower base clocks
-- Moderate IPC
+- Many cores / threads (20 cores / 40 threads per machine)
+- Lower base clocks (2.8 GHz base / 3.6 GHz turbo)
+- Moderate but stable IPC
 - Strong memory bandwidth
 - Stable NUMA topology
 
@@ -104,6 +124,7 @@ AxVM-Xv2 embraces Ivy Bridge's strengths instead of fighting its limitations.
 - **Deterministic scheduling**
 - **NUMA-aware by default**
 - **No legacy device emulation**
+- **VirtIO as the standard for I/O**
 
 The objective is to make a system like a Xeon E5-2680 v2 behave, in aggregate, as efficiently as a much smaller set of high-clock cores.
 
@@ -115,9 +136,9 @@ The objective is to make a system like a Xeon E5-2680 v2 behave, in aggregate, a
 - No software CPU emulation
 - One host thread per vCPU
 - Static CPU pinning
-- Batched I/O handling
-- VirtIO-only devices
+- I/O handled via VirtIO-MMIO
 - Direct Linux kernel boot (no legacy BIOS)
+- Huge Pages (THP) for guest memory
 
 ```
 Axion Control Plane
@@ -126,42 +147,59 @@ Axion Control Plane
     AxVM-Xv2
         |
         v
-    /dev/kvm
+    /dev/kvm ── VirtIO Block ── disk.img
 ```
 
 AxVM is a **runtime engine**, not a scheduler or orchestrator. Those responsibilities belong to Axion.
 
 ---
 
-## CPU Requirements
+## Implemented Features
 
-This AxVM profile **will refuse to run** unless the host CPU meets all requirements.
+### CPU & Memory
+- [x] KVM integration and capability detection
+- [x] Guest memory allocation with mmap + Huge Pages
+- [x] x86-64 long mode bootstrap
+- [x] 4-level page tables (1GB pages)
+- [x] 64-bit GDT with correct segments
 
-Minimum requirements:
-- Intel CPU
-- Ivy Bridge-EP (Xeon E5 v2)
-- VT-x
-- EPT (Extended Page Tables)
-- Invariant TSC
-- x2APIC
+### Linux Boot
+- [x] bzImage loading (protocol 2.15)
+- [x] Zero Page configuration
+- [x] E820 memory map (with BIOS hole)
+- [x] Kernel command line
 
-Optional features (used when available):
-- TSC scaling
-- APIC virtualization
-- Large pages (1G)
+### ACPI & SMP
+- [x] RSDP in BIOS region (0xE0000)
+- [x] RSDT with MADT pointer
+- [x] MADT with Local APIC entries
+- [x] Multi-vCPU support (up to 20)
+
+### Devices
+- [x] UART 8250 serial console
+- [x] PIT Timer (via KVM)
+- [x] IRQ Chip (via KVM)
+- [x] VirtIO-MMIO Block Device
+  - Device detection and feature negotiation
+  - Queue setup (descriptors, available, used rings)
+  - Data plane (read/write to disk.img)
+
+### Runtime
+- [x] VM exit handling (IO, MMIO, HLT, Shutdown)
+- [x] Graceful shutdown (Ctrl+C signal handling)
+- [x] Performance metrics collection
 
 ---
 
-## What AxVM-Xv2 Does Differently
+## Roadmap
 
-- Assumes **low per-core performance**
-- Optimizes for **many runnable vCPUs**
-- Reduces context switching overhead
-- Prefers throughput over latency
-- Uses aggressive batching strategies
-- Treats NUMA boundaries as first-class constraints
-
-This profile intentionally avoids optimizations meant for high-frequency CPUs.
+- [ ] IRQ injection for VirtIO (complete async I/O)
+- [ ] IO-APIC emulation
+- [ ] SMP Application Processor startup (SIPI handling)
+- [ ] VirtIO-Net networking
+- [ ] Explicit EPT configuration
+- [ ] NUMA-aware memory allocation
+- [ ] Full integration with Axion control plane
 
 ---
 
@@ -186,22 +224,6 @@ AxVM exposes a stable control interface. Its internal implementation is profile-
 
 ---
 
-## Roadmap
-
-- [x] KVM integration and capability detection
-- [x] Guest memory allocation with mmap
-- [x] x86-64 long mode bootstrap
-- [x] Basic VM exit handling (IO, HLT, Shutdown)
-- [x] Graceful shutdown (Ctrl+C signal handling)
-- [x] Performance metrics collection
-- [ ] Multi-vCPU support
-- [ ] VirtIO device emulation
-- [ ] EPT configuration
-- [ ] NUMA-aware memory allocation
-- [ ] Integration with Axion control plane
-
----
-
 ## Philosophy
 
 > Hardware diversity is not a problem to abstract away.  
@@ -213,4 +235,8 @@ AxVM exists to make old and modern hardware equally *respected*, not equally *ge
 
 ## License
 
-MIT
+**Restricted Use** — This software is the exclusive property of Daniel Rodrigues and Axion.
+
+Use, copying, modification, or distribution of this software is not permitted without prior written authorization.
+
+© 2024-2025 Daniel Rodrigues / Axion. All rights reserved.
